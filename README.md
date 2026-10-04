@@ -21,7 +21,7 @@ Session start registers scan and status for each enabled server. Scan registers 
 | `mcp__<server>__events__<event>__subscribe` | `events/subscribe`, when delivery includes `webhook`. |
 | `mcp__<server>__events__<event>__unsubscribe` | `events/unsubscribe`. |
 | `mcp__<server>__events__<event>__poll` | `events/poll`, when delivery includes `poll`. One request. Call again immediately when `hasMore` is true, otherwise after `nextPollMs`. |
-| `mcp__<server>__events__<event>__stream` | `events/stream`, when delivery includes `push`. Reads until `waitMs` (default 15s) or `maxEvents` (default 20). Heartbeats advance the cursor. |
+| `mcp__<server>__events__<event>__stream` | `events/stream`, when delivery includes `push`. Waits for `maxEvents` events (default 1) with no time limit. `waitMs` is only for when the user asked for a time limit. Heartbeats advance the cursor. |
 
 Webhook requests match the ChatGPT slice:
 
@@ -58,6 +58,6 @@ cd ~/repos/pi-mcp-events
 npm install --ignore-scripts
 ```
 
-Add the package path to pi's `extensions` setting, or install `pi-mcp-events` from npm. The published package is the TypeScript sources pi loads. Version 0.1.0.
+Add the package path to pi's `extensions` setting, or install `pi-mcp-events` from npm. The published package is the TypeScript sources pi loads. Version 0.1.1.
 
 `npm publish` runs the tests through `prepublishOnly`.

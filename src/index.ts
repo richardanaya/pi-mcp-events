@@ -135,7 +135,7 @@ export default function mcpEventsExtension(pi: ExtensionAPI) {
 				parameters: Type.Object({
 					arguments: argumentsSchema,
 					cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-					maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+					maxEvents: Type.Optional(Type.Integer({ minimum: 1 })),
 					maxAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
 				}),
 				async execute(_id, params, signal, _onUpdate, ctx) {
@@ -152,16 +152,16 @@ export default function mcpEventsExtension(pi: ExtensionAPI) {
 			register({
 				name: toolName(server.name, "stream", event.name),
 				label: `${server.name} ${event.name} stream`,
-				description: `${about}Read the push stream for event ${event.name} on MCP server ${server.name} (events/stream). Direct tool. Returns events that arrive within waitMs or until maxEvents, then closes the stream. Heartbeats advance the cursor.`,
-				promptSnippet: `Read the push stream for ${event.name} on ${server.name}`,
+				description: `${about}Read the push stream for event ${event.name} on MCP server ${server.name} (events/stream). Direct tool. Wait for maxEvents events, default 1, with no time limit. Do not pass waitMs unless the user asked for a time limit. Heartbeats advance the cursor.`,
+				promptSnippet: `Wait for one ${event.name} event on ${server.name}. Do not set a time limit unless asked.`,
 				exposure: "direct",
 				namespace,
 				parameters: Type.Object({
 					arguments: argumentsSchema,
 					cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 					maxAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
-					maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, default: 20 })),
-					waitMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 120000, default: 15000 })),
+					maxEvents: Type.Optional(Type.Integer({ minimum: 1, default: 1 })),
+					waitMs: Type.Optional(Type.Integer({ minimum: 0 })),
 				}),
 				async execute(_id, params, signal, _onUpdate, ctx) {
 					bind(ctx);
@@ -172,7 +172,7 @@ export default function mcpEventsExtension(pi: ExtensionAPI) {
 								ctx.cwd,
 								getAgentDir(),
 								(provider) => providerToken(ctx, provider),
-								{ name: event.name, ...params, maxEvents: params.maxEvents ?? 20, waitMs: params.waitMs ?? 15000 },
+								{ name: event.name, ...params, maxEvents: params.maxEvents ?? 1 },
 								signal,
 							),
 						);

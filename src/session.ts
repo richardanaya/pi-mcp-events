@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { McpError, StdioTransport, StreamableHttpTransport } from "@earendil-works/pi-mcp";
 import { resolveAuth } from "./auth.ts";
 import { type EventOccurrence, listEventTypes, parseEventOccurrence } from "./events.ts";
-import { EventSession } from "./wire.ts";
+import { armTimeout, EventSession } from "./wire.ts";
 import { expandEnv, isHttpServer, type DiscoveredServer, type ServerConfig } from "./servers.ts";
 
 export interface ServerScan {
@@ -140,13 +140,13 @@ export async function pollEvents(
 	}
 }
 
-/** Read one `events/stream` until `waitMs`, `maxEvents`, or abort, then cancel it. Heartbeats advance the cursor. */
+/** Read one `events/stream` until `maxEvents`, an optional `waitMs`, or abort, then cancel it. Heartbeats advance the cursor. No wait means the stream stays open until enough events arrive or the caller aborts. */
 export async function readEventStream(
 	server: DiscoveredServer,
 	cwd: string,
 	agentDirectory: string,
 	providerToken: (provider: string) => Promise<string | undefined>,
-	params: { name: string; arguments?: Record<string, unknown>; cursor?: string | null; maxAgeMs?: number; maxEvents: number; waitMs: number },
+	params: { name: string; arguments?: Record<string, unknown>; cursor?: string | null; maxAgeMs?: number; maxEvents?: number; waitMs?: number },
 	signal?: AbortSignal,
 ): Promise<{ events: EventOccurrence[]; cursor: string | null; truncated: boolean }> {
 	const opened = await openServer(server, cwd, agentDirectory, providerToken, signal);
@@ -156,7 +156,7 @@ export async function readEventStream(
 	const stop = new AbortController();
 	const onAbort = () => stop.abort();
 	signal?.addEventListener("abort", onAbort);
-	const timer = setTimeout(() => stop.abort(), params.waitMs);
+	const cancelWait = params.waitMs === undefined ? undefined : armTimeout(params.waitMs, () => stop.abort());
 	const takeCursor = (payload: unknown) => {
 		if (!isRecord(payload)) return;
 		if (typeof payload.cursor === "string") cursor = payload.cursor;
@@ -167,7 +167,7 @@ export async function readEventStream(
 		if (!parsed) return;
 		events.push(parsed);
 		if (parsed.cursor !== undefined) cursor = parsed.cursor ?? null;
-		if (events.length >= params.maxEvents) stop.abort();
+		if (params.maxEvents !== undefined && events.length >= params.maxEvents) stop.abort();
 	});
 	const offActive = opened.session.onNotification("notifications/events/active", (payload) => {
 		takeCursor(payload);
@@ -183,7 +183,7 @@ export async function readEventStream(
 				cursor: params.cursor ?? null,
 				...(params.maxAgeMs === undefined ? {} : { maxAgeMs: params.maxAgeMs }),
 			},
-			{ signal: stop.signal, timeoutMs: params.waitMs + 5_000 },
+			{ signal: stop.signal, timeoutMs: params.waitMs === undefined ? null : params.waitMs + 5_000 },
 		);
 		try {
 			await pending;
@@ -192,7 +192,7 @@ export async function readEventStream(
 		}
 		return { events, cursor, truncated };
 	} finally {
-		clearTimeout(timer);
+		cancelWait?.();
 		signal?.removeEventListener("abort", onAbort);
 		offEvent();
 		offActive();

@@ -12,7 +12,7 @@ import {
 /** Current MCP revision. Events in ChatGPT are defined on this version, not on `initialize`. */
 export const PROTOCOL_VERSION = "2026-07-28";
 
-const CLIENT_INFO = { name: "pi-mcp-events", version: "0.1.0" };
+const CLIENT_INFO = { name: "pi-mcp-events", version: "0.1.1" };
 
 export function protocolMeta(): Record<string, unknown> {
 	return {
@@ -51,7 +51,7 @@ function stringField(value: unknown): string | undefined {
 interface Pending {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
-	timer: NodeJS.Timeout;
+	cancelTimer?: () => void;
 	onAbort: () => void;
 	signal?: AbortSignal;
 }
@@ -109,9 +109,10 @@ export class EventSession {
 		});
 	}
 
-	request(method: string, params: Record<string, unknown> | undefined, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<unknown> {
+	request(method: string, params: Record<string, unknown> | undefined, options: { signal?: AbortSignal; timeoutMs?: number | null } = {}): Promise<unknown> {
 		if (this.closed) return Promise.reject(new Error("MCP connection closed"));
-		return send(this.transport, this.state, method, params, options.timeoutMs ?? 60_000, options.signal);
+		const timeoutMs = options.timeoutMs === undefined ? 60_000 : options.timeoutMs;
+		return send(this.transport, this.state, method, params, timeoutMs, options.signal);
 	}
 
 	async close(): Promise<void> {
@@ -123,12 +124,26 @@ export class EventSession {
 	}
 }
 
+/** Node clamps `setTimeout` delays above 2^31-1 to 1ms. Chain slices so a long stream wait is real. */
+export function armTimeout(ms: number, fn: () => void): () => void {
+	const cap = 2_147_483_647;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const schedule = (left: number) => {
+		timer = setTimeout(() => {
+			if (left > cap) schedule(left - cap);
+			else fn();
+		}, Math.min(Math.max(left, 0), cap));
+	};
+	schedule(ms);
+	return () => clearTimeout(timer);
+}
+
 function deliver(state: RpcState, message: JsonRpcMessage): void {
 	if (!isJsonRpcResponse(message)) return;
 	const entry = state.pending.get(message.id);
 	if (!entry) return;
 	state.pending.delete(message.id);
-	clearTimeout(entry.timer);
+	entry.cancelTimer?.();
 	entry.signal?.removeEventListener("abort", entry.onAbort);
 	if ("error" in message) entry.reject(new McpError(message.error.code, message.error.message, message.error.data));
 	else entry.resolve(message.result);
@@ -136,7 +151,7 @@ function deliver(state: RpcState, message: JsonRpcMessage): void {
 
 function failAll(state: RpcState, error: Error): void {
 	for (const entry of state.pending.values()) {
-		clearTimeout(entry.timer);
+		entry.cancelTimer?.();
 		entry.reject(error);
 	}
 	state.pending.clear();
@@ -147,7 +162,7 @@ function send(
 	state: RpcState,
 	method: string,
 	params: Record<string, unknown> | undefined,
-	timeoutMs: number,
+	timeoutMs: number | null,
 	signal?: AbortSignal,
 ): Promise<unknown> {
 	if (signal?.aborted) return Promise.reject(new Error("aborted"));
@@ -163,13 +178,16 @@ function send(
 			resolve,
 			reject,
 			signal,
-			timer: setTimeout(() => {
-				state.pending.delete(id);
-				signal?.removeEventListener("abort", entry.onAbort);
-				reject(new Error(`MCP ${method} timed out after ${timeoutMs}ms`));
-			}, timeoutMs),
+			cancelTimer:
+				timeoutMs === null
+					? undefined
+					: armTimeout(timeoutMs, () => {
+							state.pending.delete(id);
+							signal?.removeEventListener("abort", entry.onAbort);
+							reject(new Error(`MCP ${method} timed out after ${timeoutMs}ms`));
+						}),
 			onAbort: () => {
-				clearTimeout(entry.timer);
+				entry.cancelTimer?.();
 				state.pending.delete(id);
 				reject(new Error("aborted"));
 				const cancel: JsonRpcMessage = { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } };
@@ -179,7 +197,7 @@ function send(
 		state.pending.set(id, entry);
 		signal?.addEventListener("abort", entry.onAbort, { once: true });
 		transport.send(body).catch((error: unknown) => {
-			clearTimeout(entry.timer);
+			entry.cancelTimer?.();
 			state.pending.delete(id);
 			reject(error instanceof Error ? error : new Error(String(error)));
 		});
