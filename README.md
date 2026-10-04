@@ -2,7 +2,9 @@
 
 A pi extension that finds the MCP servers `/mcp` already knows and manages [MCP Events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md) on them.
 
-Pi's own MCP client does not implement events. This extension connects with `@earendil-works/pi-mcp` and calls `events/list`, `events/poll`, `events/stream`, `events/subscribe`, and `events/unsubscribe` through the generic JSON-RPC request method.
+Pi's own MCP client speaks the `2025-11-25` handshake and does not implement events. This extension opens MCP `2026-07-28`: `server/discover` first, then each request carries `io.modelcontextprotocol/protocolVersion` in `_meta`. There is no `initialize`.
+
+Only the ChatGPT webhook slice is implemented. Poll and push are not. `events/list` keeps event types whose `delivery` includes `"webhook"`. Subscribe and unsubscribe send `delivery.mode: "webhook"`. The secret is `whsec_` plus base64 of 24–64 bytes, and the callback must be `https`. Subscriptions are stored in `<getAgentDir()>/mcp-events.json`. While pi is open, a subscription is refreshed one minute before `refreshBefore`, sending the last cursor. This process does not receive the webhook. The callback URL you pass does.
 
 ## Servers and auth
 
@@ -27,9 +29,7 @@ Event types are not registered one-by-one. The same tools manage every server:
 | Tool | Protocol |
 | --- | --- |
 | `mcp_events_status` | none (config and last scan) |
-| `mcp_events_scan` | `events/list` |
-| `mcp_events_poll` | `events/poll` |
-| `mcp_events_stream` | `events/stream`, closed after `waitMs` or `maxEvents` |
+| `mcp_events_scan` | `server/discover`, then `events/list` |
 | `mcp_events_subscribe` | `events/subscribe` |
 | `mcp_events_unsubscribe` | `events/unsubscribe` |
 

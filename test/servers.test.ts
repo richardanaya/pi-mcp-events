@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { mcpAuthKey } from "../src/auth.ts";
-import { parseEventOccurrence, parseEventType } from "../src/events.ts";
+import { parseEventType } from "../src/events.ts";
 import { expandEnv, loadServers } from "../src/servers.ts";
 
 describe("loadServers", () => {
@@ -62,28 +62,15 @@ describe("env", () => {
 });
 
 describe("event parsing", () => {
-	it("keeps known delivery modes and occurrence fields", () => {
+	it("keeps webhook and drops other delivery modes", () => {
 		const type = parseEventType({
 			name: "email.received",
 			description: "inbox",
-			delivery: ["poll", "carrier-pigeon"],
+			delivery: ["poll", "webhook", "carrier-pigeon"],
 			inputSchema: { type: "object" },
 		});
-		assert.deepEqual(type, {
-			name: "email.received",
-			description: "inbox",
-			delivery: ["poll"],
-			inputSchema: { type: "object" },
-		});
+		assert.deepEqual(type?.delivery, ["webhook"]);
 		assert.equal(parseEventType({ name: "" }), undefined);
-		const event = parseEventOccurrence({
-			eventId: "evt_1",
-			name: "email.received",
-			timestamp: "2026-02-19T15:30:00Z",
-			data: { subject: "hi" },
-			cursor: null,
-		});
-		assert.equal(event?.cursor, null);
-		assert.equal(event?.data.subject, "hi");
+		assert.deepEqual(parseEventType({ name: "email.received", delivery: ["poll"] })?.delivery, []);
 	});
 });
