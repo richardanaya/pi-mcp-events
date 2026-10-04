@@ -1,41 +1,51 @@
 # pi-mcp-events
 
-A pi extension that finds the MCP servers `/mcp` already knows and manages [MCP Events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md) on them.
+A pi extension that manages MCP events on the servers `/mcp` already knows.
 
-Pi's own MCP client speaks the `2025-11-25` handshake and does not implement events. This extension opens MCP `2026-07-28`: `server/discover` first, then each request carries `io.modelcontextprotocol/protocolVersion` in `_meta`. There is no `initialize`.
+Events are not part of the MCP specification. The written text is the [draft design sketch](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md). ChatGPT implements the webhook slice of that draft on protocol `2026-07-28`. This extension speaks that protocol and that slice, and it also calls poll and push when a server advertises them.
 
-`events/list` keeps each event type's `delivery` array (`poll`, `push`, `webhook`). Use only a mode that type advertises. Webhook subscribe and unsubscribe send `delivery.mode: "webhook"`. The secret is `whsec_` plus base64 of 24–64 bytes, and the callback must be `https`. Subscriptions are stored in `<getAgentDir()>/mcp-events.json`. While pi is open, a webhook subscription is refreshed one minute before `refreshBefore`, sending the last cursor. This process does not receive the webhook. The callback URL you pass does. Poll is one `events/poll` per call. Push reads `events/stream` until `waitMs` or `maxEvents`, and heartbeats update the cursor.
+Pi's own MCP client does not implement events. It still uses the `2025-11-25` `initialize` handshake. This package opens its own connection: `server/discover` first, then every request carries `io.modelcontextprotocol/protocolVersion: "2026-07-28"` in `_meta`. A server that only speaks `2025-11-25` fails discovery and is reported as an error.
 
-## Servers and auth
+## What is supported
 
-It reads the same places `/mcp` does:
+`events/list` returns each event type with a `delivery` array. A tool runs only when that array includes the mode. If you have not scanned yet, the tool does not know the list and lets the server accept or reject the call.
 
-- `<getAgentDir()>/mcp.json`. That is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. The directory name comes from `CONFIG_DIR_NAME` in the coding-agent package (`piConfig.configDir`, default `.pi`), and the env var name is `${APP_NAME}_CODING_AGENT_DIR`.
-- `<cwd>/<CONFIG_DIR_NAME>/mcp.json` when the project is trusted
-- servers registered with `pi.registerMcpServer()`, unless a file already defines that name
+| Tool | Method | When |
+| --- | --- | --- |
+| `mcp_events_status` | none | Shows configured servers, how each one authenticates, and the last scan. Does not connect. |
+| `mcp_events_scan` | `server/discover`, then `events/list` | Connects when called. Keeps types whose delivery includes `poll`, `push`, or `webhook`. |
+| `mcp_events_subscribe` | `events/subscribe` | `delivery` includes `webhook`. |
+| `mcp_events_unsubscribe` | `events/unsubscribe` | Same server, event name, arguments, and callback URL as subscribe. |
+| `mcp_events_poll` | `events/poll` | `delivery` includes `poll`. One request. Call again immediately when `hasMore` is true, otherwise after `nextPollMs`. |
+| `mcp_events_stream` | `events/stream` | `delivery` includes `push`. Reads until `waitMs` (default 15s) or `maxEvents` (default 20), then closes the stream. Heartbeats advance the cursor. |
 
-HTTP auth matches pi:
+Webhook requests match the ChatGPT slice:
 
-- an `Authorization` header, with `${VAR}` expanded from the environment
-- `auth.provider`, using the token from `/login` for that provider
-- otherwise the OAuth access token `/mcp` saved in `mcp-auth.json` under `mcp__<name>|<url>`
+- `delivery.mode` is `"webhook"`.
+- The callback URL is `https`.
+- The secret is `whsec_` plus base64 of 24–64 bytes. The caller supplies it. The extension does not generate it.
+- `cursor: null` starts from now. A later subscribe sends the cursor from the previous subscribe response.
+- The same server, event name, arguments, and URL refresh the subscription. The result is stored in `<getAgentDir()>/mcp-events.json`. While pi is open, refresh runs one minute before `refreshBefore`. If pi was closed past that time, the next session start sends the refresh.
 
-It does not open a browser. A server with no stored token is reported as needing `/mcp` sign-in.
+## What is not supported
 
-## Tools
+- This process does not receive webhooks. It does not answer a `verification` challenge or check a delivery signature on a listening port. The callback URL you pass has to do that. A helper that checks a signature exists in the package and is not wired to a server.
+- The stored cursor does not move when events are delivered. It moves on subscribe, refresh, poll, and stream.
+- Push is a bounded read, not a standing subscription. There is no reconnect, and `notifications/events/error` and `notifications/events/terminated` are not handled.
+- Poll is not a background loop. The model calls the tool again.
+- `notifications/events/list_changed` is not watched. The connection closes when the tool finishes.
+- `gap` and `terminated` webhook control messages are not handled. ChatGPT does not support them either.
+- No browser sign-in. HTTP auth is an `Authorization` header, a `/login` provider token, or the OAuth access token `/mcp` already saved in `mcp-auth.json`.
 
-Event types are not registered one-by-one. The same tools manage every server:
+## Servers
 
-| Tool | Protocol |
-| --- | --- |
-| `mcp_events_status` | none (config and last scan) |
-| `mcp_events_scan` | `server/discover`, then `events/list` |
-| `mcp_events_poll` | `events/poll`, when delivery includes `poll` |
-| `mcp_events_stream` | `events/stream`, when delivery includes `push` |
-| `mcp_events_subscribe` | `events/subscribe`, when delivery includes `webhook` |
-| `mcp_events_unsubscribe` | `events/unsubscribe` |
+Same places as `/mcp`:
 
-`mcp_events_scan` connects only when called, so it does not start a second copy of each stdio server at session startup.
+- `<getAgentDir()>/mcp.json`. `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. The directory name is `CONFIG_DIR_NAME` from the coding-agent package (`piConfig.configDir`, default `.pi`). The env var is `${APP_NAME}_CODING_AGENT_DIR`.
+- `<cwd>/<CONFIG_DIR_NAME>/mcp.json` when the project is trusted.
+- `pi.registerMcpServer()`, unless a file already defines that name.
+
+A scan does not run at session startup, so it does not start a second copy of each stdio server.
 
 ## Install
 
@@ -44,6 +54,6 @@ cd ~/repos/pi-mcp-events
 npm install --ignore-scripts
 ```
 
-Add the package path to pi's `extensions` setting, or install it from npm as `pi-mcp-events`. The package publishes the TypeScript sources pi loads. Version 0.1.0.
+Add the package path to pi's `extensions` setting, or install `pi-mcp-events` from npm. The published package is the TypeScript sources pi loads. Version 0.1.0.
 
-Publish with `npm publish` from a clean tree after `npm test`. `prepublishOnly` runs the tests.
+`npm publish` runs the tests through `prepublishOnly`.
