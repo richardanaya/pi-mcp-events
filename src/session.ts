@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { McpError, StdioTransport, StreamableHttpTransport } from "@earendil-works/pi-mcp";
 import { resolveAuth } from "./auth.ts";
-import { listEventTypes } from "./events.ts";
+import { type EventOccurrence, listEventTypes, parseEventOccurrence } from "./events.ts";
 import { EventSession } from "./wire.ts";
 import { expandEnv, isHttpServer, type DiscoveredServer, type ServerConfig } from "./servers.ts";
 
@@ -82,6 +82,122 @@ export async function scanServer(
 			auth: "unknown",
 			error: error instanceof McpError ? error.message : error instanceof Error ? error.message : String(error),
 		};
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export interface PollResult {
+	events: EventOccurrence[];
+	cursor: string | null;
+	truncated: boolean;
+	hasMore: boolean;
+	nextPollMs?: number;
+}
+
+/** One `events/poll`. The caller repeats it: immediately when `hasMore` is true, otherwise after `nextPollMs`. */
+export async function pollEvents(
+	server: DiscoveredServer,
+	cwd: string,
+	agentDirectory: string,
+	providerToken: (provider: string) => Promise<string | undefined>,
+	params: { name: string; arguments?: Record<string, unknown>; cursor?: string | null; maxEvents?: number; maxAgeMs?: number },
+	signal?: AbortSignal,
+): Promise<PollResult> {
+	const opened = await openServer(server, cwd, agentDirectory, providerToken, signal);
+	try {
+		const result = await opened.session.request(
+			"events/poll",
+			{
+				name: params.name,
+				...(params.arguments ? { arguments: params.arguments } : {}),
+				cursor: params.cursor ?? null,
+				...(params.maxEvents === undefined ? {} : { maxEvents: params.maxEvents }),
+				...(params.maxAgeMs === undefined ? {} : { maxAgeMs: params.maxAgeMs }),
+			},
+			{ signal, timeoutMs: (server.config.timeout ?? 60) * 1000 },
+		);
+		if (!isRecord(result) || !Array.isArray(result.events)) throw new Error("Invalid events/poll result");
+		const events: EventOccurrence[] = [];
+		for (const entry of result.events) {
+			const parsed = parseEventOccurrence(entry);
+			if (!parsed) throw new Error("Invalid event in events/poll");
+			events.push(parsed);
+		}
+		const cursor = result.cursor === null || result.cursor === undefined ? null : result.cursor;
+		if (cursor !== null && typeof cursor !== "string") throw new Error("Invalid events/poll cursor");
+		return {
+			events,
+			cursor,
+			truncated: result.truncated === true,
+			hasMore: result.hasMore === true,
+			...(typeof result.nextPollMs === "number" ? { nextPollMs: result.nextPollMs } : {}),
+		};
+	} finally {
+		await opened.close();
+	}
+}
+
+/** Read one `events/stream` until `waitMs`, `maxEvents`, or abort, then cancel it. Heartbeats advance the cursor. */
+export async function readEventStream(
+	server: DiscoveredServer,
+	cwd: string,
+	agentDirectory: string,
+	providerToken: (provider: string) => Promise<string | undefined>,
+	params: { name: string; arguments?: Record<string, unknown>; cursor?: string | null; maxAgeMs?: number; maxEvents: number; waitMs: number },
+	signal?: AbortSignal,
+): Promise<{ events: EventOccurrence[]; cursor: string | null; truncated: boolean }> {
+	const opened = await openServer(server, cwd, agentDirectory, providerToken, signal);
+	const events: EventOccurrence[] = [];
+	let cursor: string | null = params.cursor ?? null;
+	let truncated = false;
+	const stop = new AbortController();
+	const onAbort = () => stop.abort();
+	signal?.addEventListener("abort", onAbort);
+	const timer = setTimeout(() => stop.abort(), params.waitMs);
+	const takeCursor = (payload: unknown) => {
+		if (!isRecord(payload)) return;
+		if (typeof payload.cursor === "string") cursor = payload.cursor;
+		else if (payload.cursor === null) cursor = null;
+	};
+	const offEvent = opened.session.onNotification("notifications/events/event", (payload) => {
+		const parsed = parseEventOccurrence(payload);
+		if (!parsed) return;
+		events.push(parsed);
+		if (parsed.cursor !== undefined) cursor = parsed.cursor ?? null;
+		if (events.length >= params.maxEvents) stop.abort();
+	});
+	const offActive = opened.session.onNotification("notifications/events/active", (payload) => {
+		takeCursor(payload);
+		if (isRecord(payload) && payload.truncated === true) truncated = true;
+	});
+	const offHeartbeat = opened.session.onNotification("notifications/events/heartbeat", takeCursor);
+	try {
+		const pending = opened.session.request(
+			"events/stream",
+			{
+				name: params.name,
+				...(params.arguments ? { arguments: params.arguments } : {}),
+				cursor: params.cursor ?? null,
+				...(params.maxAgeMs === undefined ? {} : { maxAgeMs: params.maxAgeMs }),
+			},
+			{ signal: stop.signal, timeoutMs: params.waitMs + 5_000 },
+		);
+		try {
+			await pending;
+		} catch (error) {
+			if (!stop.signal.aborted && !signal?.aborted) throw error;
+		}
+		return { events, cursor, truncated };
+	} finally {
+		clearTimeout(timer);
+		signal?.removeEventListener("abort", onAbort);
+		offEvent();
+		offActive();
+		offHeartbeat();
+		await opened.close();
 	}
 }
 

@@ -4,7 +4,7 @@ A pi extension that finds the MCP servers `/mcp` already knows and manages [MCP 
 
 Pi's own MCP client speaks the `2025-11-25` handshake and does not implement events. This extension opens MCP `2026-07-28`: `server/discover` first, then each request carries `io.modelcontextprotocol/protocolVersion` in `_meta`. There is no `initialize`.
 
-Only the ChatGPT webhook slice is implemented. Poll and push are not. `events/list` keeps event types whose `delivery` includes `"webhook"`. Subscribe and unsubscribe send `delivery.mode: "webhook"`. The secret is `whsec_` plus base64 of 24–64 bytes, and the callback must be `https`. Subscriptions are stored in `<getAgentDir()>/mcp-events.json`. While pi is open, a subscription is refreshed one minute before `refreshBefore`, sending the last cursor. This process does not receive the webhook. The callback URL you pass does.
+`events/list` keeps each event type's `delivery` array (`poll`, `push`, `webhook`). Use only a mode that type advertises. Webhook subscribe and unsubscribe send `delivery.mode: "webhook"`. The secret is `whsec_` plus base64 of 24–64 bytes, and the callback must be `https`. Subscriptions are stored in `<getAgentDir()>/mcp-events.json`. While pi is open, a webhook subscription is refreshed one minute before `refreshBefore`, sending the last cursor. This process does not receive the webhook. The callback URL you pass does. Poll is one `events/poll` per call. Push reads `events/stream` until `waitMs` or `maxEvents`, and heartbeats update the cursor.
 
 ## Servers and auth
 
@@ -30,7 +30,9 @@ Event types are not registered one-by-one. The same tools manage every server:
 | --- | --- |
 | `mcp_events_status` | none (config and last scan) |
 | `mcp_events_scan` | `server/discover`, then `events/list` |
-| `mcp_events_subscribe` | `events/subscribe` |
+| `mcp_events_poll` | `events/poll`, when delivery includes `poll` |
+| `mcp_events_stream` | `events/stream`, when delivery includes `push` |
+| `mcp_events_subscribe` | `events/subscribe`, when delivery includes `webhook` |
 | `mcp_events_unsubscribe` | `events/unsubscribe` |
 
 `mcp_events_scan` connects only when called, so it does not start a second copy of each stdio server at session startup.

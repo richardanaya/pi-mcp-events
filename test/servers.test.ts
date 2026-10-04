@@ -62,15 +62,15 @@ describe("env", () => {
 });
 
 describe("event parsing", () => {
-	it("keeps webhook and drops other delivery modes", () => {
+	it("keeps poll, push, and webhook", () => {
 		const type = parseEventType({
 			name: "email.received",
 			description: "inbox",
-			delivery: ["poll", "webhook", "carrier-pigeon"],
+			delivery: ["poll", "push", "webhook", "carrier-pigeon"],
 			inputSchema: { type: "object" },
 		});
-		assert.deepEqual(type?.delivery, ["webhook"]);
+		assert.deepEqual(type?.delivery, ["poll", "push", "webhook"]);
 		assert.equal(parseEventType({ name: "" }), undefined);
-		assert.deepEqual(parseEventType({ name: "email.received", delivery: ["poll"] })?.delivery, []);
+		assert.deepEqual(parseEventType({ name: "email.received", delivery: ["poll"] })?.delivery, ["poll"]);
 	});
 });

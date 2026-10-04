@@ -6,15 +6,16 @@
  * token, or the OAuth tokens `/mcp` stored in `mcp-auth.json`. This extension does not start a
  * browser sign-in.
  *
- * Event types are not registered as one tool each. The tools cover the ChatGPT webhook slice:
- * scan, subscribe, and unsubscribe.
+ * Event types are not registered as one tool each. Scan shows each type's delivery
+ * modes. Webhook, poll, and push are separate tools, and each is valid only when
+ * that mode is listed.
  */
 
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { join } from "node:path";
 import { describeHttpAuth } from "./auth.ts";
-import { type ServerScan, scanServer, serverConfigSummary, subscribeWebhook } from "./session.ts";
+import { type ServerScan, pollEvents, readEventStream, scanServer, serverConfigSummary, subscribeWebhook } from "./session.ts";
 import { isHttpServer, loadServers, type DiscoveredServer } from "./servers.ts";
 import { loadSubscriptions, parseSubscribeResult, removeSubscription, upsertSubscription, type SavedSubscription } from "./subscriptions.ts";
 import { isWebhookSecret } from "./wire.ts";
@@ -130,16 +131,85 @@ export default function mcpEventsExtension(pi: ExtensionAPI) {
 				enabled: server.enabled,
 				target: serverConfigSummary(server.config),
 				auth: isHttpServer(server.config) ? describeHttpAuth(server.name, server.config, join(getAgentDir(), "mcp-auth.json")) : { mode: "none" as const },
-				events: catalog?.servers.find((entry) => entry.server === server.name)?.events?.map((event) => event.name) ?? [],
+				events: catalog?.servers.find((entry) => entry.server === server.name)?.events?.map((event) => ({ name: event.name, delivery: event.delivery })) ?? [],
 			}));
 			return text({ errors, scannedAt: catalog?.scannedAt ?? null, servers: rows });
+		},
+	});
+
+	function requireMode(serverName: string, eventName: string, mode: string): string | undefined {
+		const listed = catalog?.servers.find((entry) => entry.server === serverName)?.events?.find((event) => event.name === eventName);
+		if (!listed) return undefined;
+		if (listed.delivery.includes(mode)) return undefined;
+		return `"${eventName}" does not advertise "${mode}". It advertises ${listed.delivery.join(", ") || "no modes"}.`;
+	}
+
+	pi.registerTool({
+		name: "mcp_events_poll",
+		label: "MCP events poll",
+		description: "One events/poll for an event type whose delivery includes \"poll\". cursor null starts from now. Call again immediately when hasMore is true, otherwise after nextPollMs. Pass the returned cursor.",
+		parameters: Type.Object({
+			server: Type.String({ description: "MCP server name" }),
+			name: Type.String({ description: "Event type name from mcp_events_scan" }),
+			arguments: argumentsSchema,
+			cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+			maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+			maxAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			bind(ctx);
+			const refused = requireMode(params.server, params.name, "poll");
+			if (refused) return text(refused, true);
+			const server = findServer(discover(ctx).servers, params.server);
+			if (!server) return text(`No enabled MCP server "${params.server}".`, true);
+			try {
+				return text(await pollEvents(server, ctx.cwd, getAgentDir(), (provider) => providerToken(ctx, provider), params, signal));
+			} catch (error) {
+				return text(error instanceof Error ? error.message : String(error), true);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "mcp_events_stream",
+		label: "MCP events stream",
+		description: "Open events/stream for an event type whose delivery includes \"push\". Returns events that arrive within waitMs or until maxEvents, then closes the stream. Heartbeats advance the cursor. cursor null starts from now.",
+		parameters: Type.Object({
+			server: Type.String(),
+			name: Type.String(),
+			arguments: argumentsSchema,
+			cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+			maxAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
+			maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, default: 20 })),
+			waitMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 120000, default: 15000 })),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			bind(ctx);
+			const refused = requireMode(params.server, params.name, "push");
+			if (refused) return text(refused, true);
+			const server = findServer(discover(ctx).servers, params.server);
+			if (!server) return text(`No enabled MCP server "${params.server}".`, true);
+			try {
+				return text(
+					await readEventStream(
+						server,
+						ctx.cwd,
+						getAgentDir(),
+						(provider) => providerToken(ctx, provider),
+						{ ...params, maxEvents: params.maxEvents ?? 20, waitMs: params.waitMs ?? 15000 },
+						signal,
+					),
+				);
+			} catch (error) {
+				return text(error instanceof Error ? error.message : String(error), true);
+			}
 		},
 	});
 
 	pi.registerTool({
 		name: "mcp_events_subscribe",
 		label: "MCP events subscribe",
-		description: "Register or refresh a webhook subscription (events/subscribe). The secret must be whsec_ plus base64 of 24 to 64 random bytes. Calling again with the same server, event name, arguments, and url refreshes the TTL. This extension does not receive the webhook; the url does.",
+		description: "Register or refresh a webhook subscription (events/subscribe) for an event type whose delivery includes \"webhook\". The secret must be whsec_ plus base64 of 24 to 64 random bytes. Calling again with the same server, event name, arguments, and url refreshes the TTL. This extension does not receive the webhook; the url does.",
 		parameters: Type.Object({
 			server: Type.String(),
 			name: Type.String(),
@@ -153,6 +223,8 @@ export default function mcpEventsExtension(pi: ExtensionAPI) {
 			bind(ctx);
 			const server = findServer(discover(ctx).servers, params.server);
 			if (!server) return text(`No enabled MCP server "${params.server}".`, true);
+			const refused = requireMode(params.server, params.name, "webhook");
+			if (refused) return text(refused, true);
 			if (!params.url.startsWith("https://")) return text("Webhook url must be https.", true);
 			if (!isWebhookSecret(params.secret)) return text("secret must be whsec_ plus base64 of 24 to 64 bytes.", true);
 			try {

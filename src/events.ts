@@ -9,7 +9,15 @@ export interface EventTypeInfo {
 	payloadSchema?: Record<string, unknown>;
 }
 
-const DELIVERY = new Set(["webhook"]);
+export interface EventOccurrence {
+	eventId: string;
+	name: string;
+	timestamp: string;
+	data: Record<string, unknown>;
+	cursor?: string | null;
+}
+
+const DELIVERY = new Set(["poll", "push", "webhook"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -24,6 +32,20 @@ export function parseEventType(value: unknown): EventTypeInfo | undefined {
 		delivery,
 		...(isRecord(value.inputSchema) ? { inputSchema: value.inputSchema } : {}),
 		...(isRecord(value.payloadSchema) ? { payloadSchema: value.payloadSchema } : {}),
+	};
+}
+
+export function parseEventOccurrence(value: unknown): EventOccurrence | undefined {
+	if (!isRecord(value) || typeof value.eventId !== "string" || typeof value.name !== "string" || typeof value.timestamp !== "string" || !isRecord(value.data)) {
+		return undefined;
+	}
+	const cursor = value.cursor;
+	return {
+		eventId: value.eventId,
+		name: value.name,
+		timestamp: value.timestamp,
+		data: value.data,
+		...(cursor === undefined ? {} : { cursor: cursor === null || typeof cursor === "string" ? cursor : undefined }),
 	};
 }
 
@@ -44,7 +66,7 @@ export async function listEventTypes(session: EventSession, signal?: AbortSignal
 		if (!isRecord(result) || !Array.isArray(result.events)) throw new Error("Invalid events/list result");
 		for (const entry of result.events) {
 			const parsed = parseEventType(entry);
-			if (!parsed || !parsed.delivery.includes("webhook")) continue;
+			if (!parsed || parsed.delivery.length === 0) continue;
 			types.push(parsed);
 		}
 		const next = result.nextCursor;
