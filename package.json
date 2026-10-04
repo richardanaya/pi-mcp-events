@@ -1,0 +1,36 @@
+{
+	"name": "pi-mcp-events",
+	"version": "0.1.0",
+	"description": "Pi extension that discovers MCP event types on configured servers and manages subscriptions",
+	"license": "MIT",
+	"type": "module",
+	"author": "Richard Anaya",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/richardanaya/pi-mcp-events.git"
+	},
+	"bugs": {
+		"url": "https://github.com/richardanaya/pi-mcp-events/issues"
+	},
+	"homepage": "https://github.com/richardanaya/pi-mcp-events#readme",
+	"keywords": ["pi", "mcp", "events", "extension"],
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"files": ["src", "README.md", "LICENSE"],
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	},
+	"scripts": {
+		"test": "node --experimental-strip-types --test test/*.test.ts",
+		"prepublishOnly": "npm test"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "1.0.2",
+		"@earendil-works/pi-mcp": "1.0.2",
+		"typebox": "1.3.27"
+	},
+	"devDependencies": {
+		"@types/node": "24.12.2"
+	}
+}
