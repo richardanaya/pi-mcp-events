@@ -6,9 +6,9 @@
  * token, or the OAuth tokens `/mcp` stored in `mcp-auth.json`. This extension does not start a
  * browser sign-in.
  *
- * Event types are not registered as one tool each. Scan shows each type's delivery
- * modes. Webhook, poll, and push are separate tools, and each is valid only when
- * that mode is listed.
+ * Tools follow pi's MCP names: `mcp__<server>__events__<event>__<action>`.
+ * Scan and status omit the event. Poll, stream, subscribe, and unsubscribe are
+ * registered only for a delivery mode that event advertises.
  */
 
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,7 +18,9 @@ import { describeHttpAuth } from "./auth.ts";
 import { type ServerScan, pollEvents, readEventStream, scanServer, serverConfigSummary, subscribeWebhook } from "./session.ts";
 import { isHttpServer, loadServers, type DiscoveredServer } from "./servers.ts";
 import { loadSubscriptions, parseSubscribeResult, removeSubscription, upsertSubscription, type SavedSubscription } from "./subscriptions.ts";
+import { createEventToolName, eventToolSegment } from "./names.ts";
 import { isWebhookSecret } from "./wire.ts";
+import type { EventTypeInfo } from "./events.ts";
 
 interface Catalog {
 	scannedAt: string;
@@ -83,7 +85,7 @@ export default function mcpEventsExtension(pi: ExtensionAPI) {
 		const loaded = loadServers({
 			cwd: ctx.cwd,
 			projectTrusted: ctx.isProjectTrusted(),
-			registered: pi.getMcpServers().map((server) => ({ name: server.name, config: server.config })),
+			registered: (typeof pi.getMcpServers === "function" ? pi.getMcpServers() : []).map((server) => ({ name: server.name, config: server.config })),
 			agentDirectory: getAgentDir(),
 			configDirName: CONFIG_DIR_NAME,
 		});
@@ -94,194 +96,228 @@ export default function mcpEventsExtension(pi: ExtensionAPI) {
 		return ctx.modelRegistry.getApiKeyForProvider(provider);
 	}
 
-	async function scanAll(ctx: Parameters<typeof discover>[0] & { modelRegistry: { getApiKeyForProvider(provider: string): Promise<string | undefined> }; signal?: AbortSignal }): Promise<Catalog> {
-		bind(ctx);
-		const { servers } = discover(ctx);
-		const token = (provider: string) => providerToken(ctx, provider);
-		const results = await Promise.all(servers.map((server) => scanServer(server, ctx.cwd, getAgentDir(), token, ctx.signal)));
-		catalog = { scannedAt: new Date().toISOString(), servers: results };
-		return catalog;
+	const registeredNames = new Set<string>();
+	const namesByKey = new Map<string, string>();
+
+	function toolName(serverName: string, action: "scan" | "status" | "poll" | "stream" | "subscribe" | "unsubscribe", eventName?: string): string {
+		const key = `${serverName}\0${action}\0${eventName ?? ""}`;
+		const existing = namesByKey.get(key);
+		if (existing) return existing;
+		const name = createEventToolName(serverName, eventToolSegment(action, eventName), (candidate) => registeredNames.has(candidate));
+		namesByKey.set(key, name);
+		return name;
 	}
 
-	pi.registerTool({
-		name: "mcp_events_scan",
-		label: "MCP events scan",
-		description: "Connect to enabled MCP servers from /mcp, using their stored auth, and list event types (events/list). Servers without an events capability are listed with an empty event list.",
-		promptSnippet: "Scan configured MCP servers for event types.",
-		parameters: Type.Object({}),
-		async execute(_id, _params, signal, _onUpdate, ctx) {
-			const { errors } = discover(ctx);
-			const scanned = await scanAll({ ...ctx, signal });
-			const types = scanned.servers.reduce((count, server) => count + (server.events?.length ?? 0), 0);
-			return text({ errors, types, ...scanned });
-		},
-	});
-
-	pi.registerTool({
-		name: "mcp_events_status",
-		label: "MCP events status",
-		description: "Show configured MCP servers, how each one authenticates, and the event types from the last scan. Does not connect.",
-		parameters: Type.Object({}),
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			bind(ctx);
-			const { servers, errors } = discover(ctx);
-			const rows = servers.map((server) => ({
-				name: server.name,
-				source: server.source,
-				enabled: server.enabled,
-				target: serverConfigSummary(server.config),
-				auth: isHttpServer(server.config) ? describeHttpAuth(server.name, server.config, join(getAgentDir(), "mcp-auth.json")) : { mode: "none" as const },
-				events: catalog?.servers.find((entry) => entry.server === server.name)?.events?.map((event) => ({ name: event.name, delivery: event.delivery })) ?? [],
-			}));
-			return text({ errors, scannedAt: catalog?.scannedAt ?? null, servers: rows });
-		},
-	});
-
-	function requireMode(serverName: string, eventName: string, mode: string): string | undefined {
-		const listed = catalog?.servers.find((entry) => entry.server === serverName)?.events?.find((event) => event.name === eventName);
-		if (!listed) return undefined;
-		if (listed.delivery.includes(mode)) return undefined;
-		return `"${eventName}" does not advertise "${mode}". It advertises ${listed.delivery.join(", ") || "no modes"}.`;
+	function register(definition: Parameters<ExtensionAPI["registerTool"]>[0]): void {
+		if (registeredNames.has(definition.name)) return;
+		registeredNames.add(definition.name);
+		pi.registerTool(definition);
 	}
 
-	pi.registerTool({
-		name: "mcp_events_poll",
-		label: "MCP events poll",
-		description: "One events/poll for an event type whose delivery includes \"poll\". cursor null starts from now. Call again immediately when hasMore is true, otherwise after nextPollMs. Pass the returned cursor.",
-		parameters: Type.Object({
-			server: Type.String({ description: "MCP server name" }),
-			name: Type.String({ description: "Event type name from mcp_events_scan" }),
-			arguments: argumentsSchema,
-			cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-			maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
-			maxAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
-		}),
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			bind(ctx);
-			const refused = requireMode(params.server, params.name, "poll");
-			if (refused) return text(refused, true);
-			const server = findServer(discover(ctx).servers, params.server);
-			if (!server) return text(`No enabled MCP server "${params.server}".`, true);
-			try {
-				return text(await pollEvents(server, ctx.cwd, getAgentDir(), (provider) => providerToken(ctx, provider), params, signal));
-			} catch (error) {
-				return text(error instanceof Error ? error.message : String(error), true);
-			}
-		},
-	});
+	function namespaceFor(server: DiscoveredServer) {
+		return {
+			name: `mcp__${server.name.replace(/[^A-Za-z0-9_]/g, "_")}`,
+			...(server.config.description ? { description: server.config.description } : {}),
+		};
+	}
 
-	pi.registerTool({
-		name: "mcp_events_stream",
-		label: "MCP events stream",
-		description: "Open events/stream for an event type whose delivery includes \"push\". Returns events that arrive within waitMs or until maxEvents, then closes the stream. Heartbeats advance the cursor. cursor null starts from now.",
-		parameters: Type.Object({
-			server: Type.String(),
-			name: Type.String(),
-			arguments: argumentsSchema,
-			cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-			maxAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
-			maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, default: 20 })),
-			waitMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 120000, default: 15000 })),
-		}),
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			bind(ctx);
-			const refused = requireMode(params.server, params.name, "push");
-			if (refused) return text(refused, true);
-			const server = findServer(discover(ctx).servers, params.server);
-			if (!server) return text(`No enabled MCP server "${params.server}".`, true);
-			try {
-				return text(
-					await readEventStream(
-						server,
-						ctx.cwd,
-						getAgentDir(),
-						(provider) => providerToken(ctx, provider),
-						{ ...params, maxEvents: params.maxEvents ?? 20, waitMs: params.waitMs ?? 15000 },
-						signal,
-					),
-				);
-			} catch (error) {
-				return text(error instanceof Error ? error.message : String(error), true);
-			}
-		},
-	});
+	function registerEventTools(server: DiscoveredServer, event: EventTypeInfo): void {
+		const about = event.description ? `${event.description} ` : "";
+		const namespace = namespaceFor(server);
+		if (event.delivery.includes("poll")) {
+			register({
+				name: toolName(server.name, "poll", event.name),
+				label: `${server.name} ${event.name} poll`,
+				description: `${about}Poll event ${event.name} on MCP server ${server.name} (events/poll). Direct tool. cursor null starts from now. Call again immediately when hasMore is true, otherwise after nextPollMs.`,
+				promptSnippet: `Poll ${event.name} on ${server.name}`,
+				exposure: "direct",
+				namespace,
+				parameters: Type.Object({
+					arguments: argumentsSchema,
+					cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+					maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+					maxAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
+				}),
+				async execute(_id, params, signal, _onUpdate, ctx) {
+					bind(ctx);
+					try {
+						return text(await pollEvents(server, ctx.cwd, getAgentDir(), (provider) => providerToken(ctx, provider), { name: event.name, ...params }, signal));
+					} catch (error) {
+						return text(error instanceof Error ? error.message : String(error), true);
+					}
+				},
+			});
+		}
+		if (event.delivery.includes("push")) {
+			register({
+				name: toolName(server.name, "stream", event.name),
+				label: `${server.name} ${event.name} stream`,
+				description: `${about}Read the push stream for event ${event.name} on MCP server ${server.name} (events/stream). Direct tool. Returns events that arrive within waitMs or until maxEvents, then closes the stream. Heartbeats advance the cursor.`,
+				promptSnippet: `Read the push stream for ${event.name} on ${server.name}`,
+				exposure: "direct",
+				namespace,
+				parameters: Type.Object({
+					arguments: argumentsSchema,
+					cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+					maxAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
+					maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, default: 20 })),
+					waitMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 120000, default: 15000 })),
+				}),
+				async execute(_id, params, signal, _onUpdate, ctx) {
+					bind(ctx);
+					try {
+						return text(
+							await readEventStream(
+								server,
+								ctx.cwd,
+								getAgentDir(),
+								(provider) => providerToken(ctx, provider),
+								{ name: event.name, ...params, maxEvents: params.maxEvents ?? 20, waitMs: params.waitMs ?? 15000 },
+								signal,
+							),
+						);
+					} catch (error) {
+						return text(error instanceof Error ? error.message : String(error), true);
+					}
+				},
+			});
+		}
+		if (event.delivery.includes("webhook")) {
+			register({
+				name: toolName(server.name, "subscribe", event.name),
+				label: `${server.name} ${event.name} subscribe`,
+				description: `${about}Subscribe to webhook delivery for event ${event.name} on MCP server ${server.name} (events/subscribe). Direct tool. The secret must be whsec_ plus base64 of 24 to 64 random bytes. The same arguments and url refresh the subscription. This process does not receive the webhook.`,
+				promptSnippet: `Subscribe to ${event.name} webhooks on ${server.name}`,
+				exposure: "direct",
+				namespace,
+				parameters: Type.Object({
+					arguments: argumentsSchema,
+					url: Type.String({ description: "https callback URL" }),
+					secret: Type.String({ description: "whsec_ signing secret" }),
+					cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+					ttlMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])),
+				}),
+				async execute(_id, params, signal, _onUpdate, ctx) {
+					bind(ctx);
+					if (!params.url.startsWith("https://")) return text("Webhook url must be https.", true);
+					if (!isWebhookSecret(params.secret)) return text("secret must be whsec_ plus base64 of 24 to 64 bytes.", true);
+					try {
+						const result = await subscribeWebhook(
+							server,
+							ctx.cwd,
+							getAgentDir(),
+							(provider) => providerToken(ctx, provider),
+							{ name: event.name, ...params },
+							signal,
+						);
+						const parsed = parseSubscribeResult(result);
+						remember({
+							server: server.name,
+							name: event.name,
+							arguments: params.arguments ?? {},
+							url: params.url,
+							secret: params.secret,
+							cursor: parsed.cursor,
+							...(parsed.id ? { id: parsed.id } : {}),
+							refreshBefore: parsed.refreshBefore,
+						});
+						return text(result);
+					} catch (error) {
+						return text(error instanceof Error ? error.message : String(error), true);
+					}
+				},
+			});
+			register({
+				name: toolName(server.name, "unsubscribe", event.name),
+				label: `${server.name} ${event.name} unsubscribe`,
+				description: `${about}Stop the webhook subscription for event ${event.name} on MCP server ${server.name} (events/unsubscribe). Direct tool. Pass the same arguments and url used to subscribe.`,
+				promptSnippet: `Unsubscribe from ${event.name} webhooks on ${server.name}`,
+				exposure: "direct",
+				namespace,
+				parameters: Type.Object({
+					arguments: argumentsSchema,
+					url: Type.String(),
+				}),
+				async execute(_id, params, signal, _onUpdate, ctx) {
+					bind(ctx);
+					try {
+						const result = await subscribeWebhook(
+							server,
+							ctx.cwd,
+							getAgentDir(),
+							(provider) => providerToken(ctx, provider),
+							{ name: event.name, ...params, secret: "", unsubscribe: true },
+							signal,
+						);
+						removeSubscription(subscriptionPath(), { server: server.name, name: event.name, arguments: params.arguments ?? {}, url: params.url });
+						const timer = refreshTimers.get(`${server.name}\n${event.name}\n${params.url}`);
+						if (timer) clearTimeout(timer);
+						return text(result ?? { ok: true });
+					} catch (error) {
+						return text(error instanceof Error ? error.message : String(error), true);
+					}
+				},
+			});
+		}
+	}
 
-	pi.registerTool({
-		name: "mcp_events_subscribe",
-		label: "MCP events subscribe",
-		description: "Register or refresh a webhook subscription (events/subscribe) for an event type whose delivery includes \"webhook\". The secret must be whsec_ plus base64 of 24 to 64 random bytes. Calling again with the same server, event name, arguments, and url refreshes the TTL. This extension does not receive the webhook; the url does.",
-		parameters: Type.Object({
-			server: Type.String(),
-			name: Type.String(),
-			arguments: argumentsSchema,
-			url: Type.String({ description: "https callback URL" }),
-			secret: Type.String({ description: "whsec_ signing secret" }),
-			cursor: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-			ttlMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])),
-		}),
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			bind(ctx);
-			const server = findServer(discover(ctx).servers, params.server);
-			if (!server) return text(`No enabled MCP server "${params.server}".`, true);
-			const refused = requireMode(params.server, params.name, "webhook");
-			if (refused) return text(refused, true);
-			if (!params.url.startsWith("https://")) return text("Webhook url must be https.", true);
-			if (!isWebhookSecret(params.secret)) return text("secret must be whsec_ plus base64 of 24 to 64 bytes.", true);
-			try {
-				const result = await subscribeWebhook(server, ctx.cwd, getAgentDir(), (provider) => providerToken(ctx, provider), params, signal);
-				const parsed = parseSubscribeResult(result);
-				remember({
-					server: params.server,
-					name: params.name,
-					arguments: params.arguments ?? {},
-					url: params.url,
-					secret: params.secret,
-					cursor: parsed.cursor,
-					...(parsed.id ? { id: parsed.id } : {}),
-					refreshBefore: parsed.refreshBefore,
-				});
-				return text(result);
-			} catch (error) {
-				return text(error instanceof Error ? error.message : String(error), true);
-			}
-		},
-	});
-
-	pi.registerTool({
-		name: "mcp_events_unsubscribe",
-		label: "MCP events unsubscribe",
-		description: "Stop a webhook subscription (events/unsubscribe) for the same server, event name, arguments, and callback url passed to mcp_events_subscribe.",
-		parameters: Type.Object({
-			server: Type.String(),
-			name: Type.String(),
-			arguments: argumentsSchema,
-			url: Type.String(),
-		}),
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			bind(ctx);
-			const server = findServer(discover(ctx).servers, params.server);
-			if (!server) return text(`No enabled MCP server "${params.server}".`, true);
-			try {
-				const result = await subscribeWebhook(
-					server,
-					ctx.cwd,
-					getAgentDir(),
-					(provider) => providerToken(ctx, provider),
-					{ ...params, secret: "", unsubscribe: true },
-					signal,
-				);
-				removeSubscription(subscriptionPath(), { server: params.server, name: params.name, arguments: params.arguments ?? {}, url: params.url });
-				const timer = refreshTimers.get(`${params.server}\n${params.name}\n${params.url}`);
-				if (timer) clearTimeout(timer);
-				return text(result ?? { ok: true });
-			} catch (error) {
-				return text(error instanceof Error ? error.message : String(error), true);
-			}
-		},
-	});
+	function registerServerTools(ctx: { cwd: string; isProjectTrusted(): boolean }): void {
+		for (const server of discover(ctx).servers) {
+			if (!server.enabled) continue;
+			const namespace = namespaceFor(server);
+			register({
+				name: toolName(server.name, "status"),
+				label: `${server.name} events status`,
+				description: `Show how MCP server ${server.name} authenticates and which event types the last scan found. Direct tool. Does not connect.`,
+				promptSnippet: `Show event status for ${server.name}`,
+				exposure: "direct",
+				namespace,
+				parameters: Type.Object({}),
+				async execute(_id, _params, _signal, _onUpdate, callCtx) {
+					bind(callCtx);
+					const current = discover(callCtx).servers.find((entry) => entry.name === server.name);
+					const events = catalog?.servers.find((entry) => entry.server === server.name)?.events ?? [];
+					return text({
+						server: server.name,
+						enabled: current?.enabled ?? false,
+						target: serverConfigSummary(server.config),
+						auth: isHttpServer(server.config) ? describeHttpAuth(server.name, server.config, join(getAgentDir(), "mcp-auth.json")) : { mode: "none" },
+						scannedAt: catalog?.scannedAt ?? null,
+						events: events.map((event) => ({ name: event.name, delivery: event.delivery })),
+					});
+				},
+			});
+			register({
+				name: toolName(server.name, "scan"),
+				label: `${server.name} events scan`,
+				description: `Connect to MCP server ${server.name} and list its event types (events/list). Direct tool. Registers mcp__${server.name}__events__<event>__<action> for each advertised delivery mode.`,
+				promptSnippet: `Scan ${server.name} for MCP event types`,
+				exposure: "direct",
+				namespace,
+				parameters: Type.Object({}),
+				async execute(_id, _params, signal, _onUpdate, callCtx) {
+					bind(callCtx);
+					const current = findServer(discover(callCtx).servers, server.name);
+					if (!current) return text(`MCP server "${server.name}" is not enabled.`, true);
+					try {
+						const result = await scanServer(current, callCtx.cwd, getAgentDir(), (provider) => providerToken(callCtx, provider), signal);
+						catalog = {
+							scannedAt: new Date().toISOString(),
+							servers: [...(catalog?.servers.filter((entry) => entry.server !== server.name) ?? []), result],
+						};
+						for (const event of result.events ?? []) registerEventTools(current, event);
+						return text({ ...result, tools: [...registeredNames].filter((name) => name.startsWith(`mcp__${server.name.replace(/[^A-Za-z0-9_]/g, "_")}__events__`)) });
+					} catch (error) {
+						return text(error instanceof Error ? error.message : String(error), true);
+					}
+				},
+			});
+		}
+	}
 
 	pi.on("session_start", (_event, ctx) => {
 		bind(ctx);
+		registerServerTools(ctx);
 		for (const sub of loadSubscriptions(subscriptionPath())) remember(sub);
 	});
 }

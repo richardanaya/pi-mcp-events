@@ -10,14 +10,18 @@ Pi's own MCP client does not implement events. It still uses the `2025-11-25` `i
 
 `events/list` returns each event type with a `delivery` array. A tool runs only when that array includes the mode. If you have not scanned yet, the tool does not know the list and lets the server accept or reject the call.
 
-| Tool | Method | When |
-| --- | --- | --- |
-| `mcp_events_status` | none | Shows configured servers, how each one authenticates, and the last scan. Does not connect. |
-| `mcp_events_scan` | `server/discover`, then `events/list` | Connects when called. Keeps types whose delivery includes `poll`, `push`, or `webhook`. |
-| `mcp_events_subscribe` | `events/subscribe` | `delivery` includes `webhook`. |
-| `mcp_events_unsubscribe` | `events/unsubscribe` | Same server, event name, arguments, and callback URL as subscribe. |
-| `mcp_events_poll` | `events/poll` | `delivery` includes `poll`. One request. Call again immediately when `hasMore` is true, otherwise after `nextPollMs`. |
-| `mcp_events_stream` | `events/stream` | `delivery` includes `push`. Reads until `waitMs` (default 15s) or `maxEvents` (default 20), then closes the stream. Heartbeats advance the cursor. |
+Names follow pi's MCP tools: `mcp__<server>__<tool>`, sanitized to `[A-Za-z0-9_]` and hashed down to 64 characters when needed. The tool segment starts with `events`. Dots in an event name become underscores, so `demo.tick` on server `sprite` is `mcp__sprite__events__demo_tick__poll`.
+
+Session start registers scan and status for each enabled server. Scan registers one tool per advertised delivery mode. The server and event are not arguments.
+
+| Tool | Method |
+| --- | --- |
+| `mcp__<server>__events__status` | none. Auth and the last scan. |
+| `mcp__<server>__events__scan` | `server/discover`, then `events/list`. |
+| `mcp__<server>__events__<event>__subscribe` | `events/subscribe`, when delivery includes `webhook`. |
+| `mcp__<server>__events__<event>__unsubscribe` | `events/unsubscribe`. |
+| `mcp__<server>__events__<event>__poll` | `events/poll`, when delivery includes `poll`. One request. Call again immediately when `hasMore` is true, otherwise after `nextPollMs`. |
+| `mcp__<server>__events__<event>__stream` | `events/stream`, when delivery includes `push`. Reads until `waitMs` (default 15s) or `maxEvents` (default 20). Heartbeats advance the cursor. |
 
 Webhook requests match the ChatGPT slice:
 

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { mcpAuthKey } from "../src/auth.ts";
 import { parseEventType } from "../src/events.ts";
+import { createEventToolName, eventToolSegment } from "../src/names.ts";
 import { expandEnv, loadServers } from "../src/servers.ts";
 
 describe("loadServers", () => {
@@ -58,6 +59,15 @@ describe("env", () => {
 	it("expands ${NAME} and fails when it is missing", () => {
 		assert.equal(expandEnv("Bearer ${TOKEN}", { TOKEN: "abc" }), "Bearer abc");
 		assert.throws(() => expandEnv("${MISSING}", {}), /MISSING/);
+	});
+});
+
+describe("tool names", () => {
+	it("uses pi's mcp__server__tool form", () => {
+		assert.equal(createEventToolName("sprite", eventToolSegment("poll", "demo.tick")), "mcp__sprite__events__demo_tick__poll");
+		assert.equal(createEventToolName("my-server", eventToolSegment("scan")), "mcp__my_server__events__scan");
+		const long = createEventToolName("s".repeat(40), eventToolSegment("subscribe", "e".repeat(40)));
+		assert.equal(long.length, 64);
 	});
 });
 
